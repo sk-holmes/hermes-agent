@@ -55,6 +55,20 @@ _DEMOTED_SESSION_SOURCES = ("cron",)
 # the handful of distinct sessions a typical query returns.
 _DISCOVER_SCAN_LIMIT = 300
 
+# ``session_search`` output is injected straight back into the active model
+# context. A single historical compaction handoff can be tens of thousands of
+# chars and often contains stale "Active Task"/"Remaining Work" text. Returning
+# it verbatim from discovery/bookends re-inflates the new session with exactly
+# the compressed history the user was trying to escape. Keep recall useful while
+# making the tool output bounded and non-recursive.
+_MESSAGE_CONTENT_MAX_CHARS = 6_000
+_TOOL_CALL_ARGUMENTS_MAX_CHARS = 1_200
+_TOOL_CALLS_MAX_ITEMS = 6
+_COMPACTION_SUMMARY_MARKERS = (
+    "[CONTEXT COMPACTION",
+    "[CONTEXT SUMMARY]",
+)
+
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
@@ -120,18 +134,126 @@ def _order_for_recall(raw_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     )
 
 
+def _text_char_len(content: Any) -> int:
+    """Best-effort character length for persisted message content."""
+    if content is None:
+        return 0
+    if isinstance(content, str):
+        return len(content)
+    try:
+        return len(json.dumps(content, ensure_ascii=False))
+    except Exception:
+        return len(str(content))
+
+
+def _is_compaction_summary_content(content: Any) -> bool:
+    if not isinstance(content, str):
+        return False
+    stripped = content.lstrip()
+    return any(stripped.startswith(marker) for marker in _COMPACTION_SUMMARY_MARKERS)
+
+
+def _truncate_string(value: str, limit: int) -> tuple[str, bool, int]:
+    original_len = len(value)
+    if original_len <= limit:
+        return value, False, original_len
+    omitted = original_len - limit
+    return (
+        value[:limit].rstrip()
+        + f"\n[session_search truncated {omitted:,} chars from this field; scroll/read a narrower window if needed]",
+        True,
+        original_len,
+    )
+
+
+def _shape_content_for_recall(content: Any) -> tuple[Any, Dict[str, Any]]:
+    """Return context-safe message content plus metadata about any elision."""
+    original_chars = _text_char_len(content)
+    if _is_compaction_summary_content(content):
+        return (
+            "[Context compaction summary omitted by session_search to prevent stale-task/context bloat. "
+            f"Original summary was {original_chars:,} chars. Search or scroll the original source messages instead.]",
+            {
+                "content_omitted": "context_compaction_summary",
+                "original_content_chars": original_chars,
+            },
+        )
+
+    if isinstance(content, str):
+        shaped, truncated, original_len = _truncate_string(content, _MESSAGE_CONTENT_MAX_CHARS)
+        meta: Dict[str, Any] = {}
+        if truncated:
+            meta["content_truncated"] = True
+            meta["original_content_chars"] = original_len
+        return shaped, meta
+
+    return content, {}
+
+
+def _shape_tool_calls_for_recall(tool_calls: Any) -> tuple[Any, Dict[str, Any]]:
+    """Return bounded tool-call metadata for recall output.
+
+    Tool-call-only assistant messages often carry large JSON arguments (for
+    example a prior ``session_search`` call that itself embedded bookends). Those
+    args are rarely the answer-bearing content the next model needs, so cap them
+    independently from message text.
+    """
+    if not tool_calls:
+        return tool_calls, {}
+
+    if not isinstance(tool_calls, list):
+        calls = [tool_calls]
+        original_count = 1
+    else:
+        calls = tool_calls
+        original_count = len(tool_calls)
+
+    shaped_calls = []
+    truncated_args = False
+    for call in calls[:_TOOL_CALLS_MAX_ITEMS]:
+        if not isinstance(call, dict):
+            shaped_calls.append(call)
+            continue
+
+        shaped = dict(call)
+        fn = shaped.get("function")
+        if isinstance(fn, dict):
+            fn_shaped = dict(fn)
+            args = fn_shaped.get("arguments")
+            if isinstance(args, str):
+                new_args, did_truncate, _ = _truncate_string(args, _TOOL_CALL_ARGUMENTS_MAX_CHARS)
+                if did_truncate:
+                    truncated_args = True
+                    fn_shaped["arguments"] = new_args
+            shaped["function"] = fn_shaped
+        shaped_calls.append(shaped)
+
+    meta: Dict[str, Any] = {}
+    if original_count > len(shaped_calls):
+        meta["tool_calls_truncated"] = True
+        meta["original_tool_call_count"] = original_count
+    if truncated_args:
+        meta["tool_call_arguments_truncated"] = True
+
+    return shaped_calls, meta
+
+
 def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[str, Any]:
     """Slim a message row for the tool response. Keeps content even if empty."""
+    shaped_content, content_meta = _shape_content_for_recall(m.get("content"))
     entry = {
         "id": m.get("id"),
         "role": m.get("role"),
-        "content": m.get("content"),
+        "content": shaped_content,
         "timestamp": m.get("timestamp"),
     }
+    entry.update(content_meta)
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
-        entry["tool_calls"] = m.get("tool_calls")
+        shaped_tool_calls, tool_meta = _shape_tool_calls_for_recall(m.get("tool_calls"))
+        entry["tool_calls"] = shaped_tool_calls
+        entry.update(tool_meta)
     if m.get("tool_call_id"):
         entry["tool_call_id"] = m.get("tool_call_id")
     if anchor_id is not None and m.get("id") == anchor_id:

@@ -16,6 +16,9 @@ from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
+    _MESSAGE_CONTENT_MAX_CHARS,
+    _TOOL_CALL_ARGUMENTS_MAX_CHARS,
+    _TOOL_CALLS_MAX_ITEMS,
     _format_timestamp,
     session_search,
 )
@@ -294,6 +297,77 @@ class TestRoleFilter:
         # Should now match the tool message
         if result["count"] > 0:
             assert result["results"][0]["matched_role"] == "tool"
+
+
+class TestRecallPayloadSafety:
+    def test_discovery_omits_context_compaction_summary_messages(self, db):
+        db.create_session("s_compacted", source="cli")
+        db.append_message("s_compacted", role="user", content="needle opener")
+        summary = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n"
+            "## Historical Remaining Work\n"
+            "needle stale task text "
+            + ("x" * 12000)
+        )
+        db.append_message("s_compacted", role="assistant", content=summary)
+        db.append_message("s_compacted", role="assistant", content="needle final decision")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["success"] is True
+        hit = result["results"][0]
+        all_messages = hit["bookend_start"] + hit["messages"] + hit["bookend_end"]
+        summary_messages = [
+            m for m in all_messages
+            if m.get("content_omitted") == "context_compaction_summary"
+        ]
+        assert summary_messages
+        assert all("Historical Remaining Work" not in m["content"] for m in summary_messages)
+        assert all("x" * 100 not in m["content"] for m in summary_messages)
+        assert summary_messages[0]["original_content_chars"] == len(summary)
+
+    def test_discovery_truncates_large_message_content(self, db):
+        db.create_session("s_large", source="cli")
+        large = "needle " + ("a" * (_MESSAGE_CONTENT_MAX_CHARS + 2000))
+        db.append_message("s_large", role="user", content=large)
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["success"] is True
+        anchor = result["results"][0]["messages"][0]
+        assert anchor["content_truncated"] is True
+        assert anchor["original_content_chars"] == len(large)
+        assert len(anchor["content"]) < len(large)
+        assert "session_search truncated" in anchor["content"]
+
+    def test_read_truncates_tool_call_arguments_and_count(self, db):
+        db.create_session("s_tools", source="cli")
+        tool_calls = [
+            {
+                "id": f"call_{i}",
+                "function": {
+                    "name": "session_search",
+                    "arguments": "{" + f'"query": "needle {i}", "blob": "' + ("z" * 4000) + '"}',
+                },
+            }
+            for i in range(_TOOL_CALLS_MAX_ITEMS + 2)
+        ]
+        db.append_message("s_tools", role="assistant", content="", tool_calls=tool_calls)
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_tools", db=db))
+
+        assert result["success"] is True
+        message = result["messages"][0]
+        assert len(message["tool_calls"]) == _TOOL_CALLS_MAX_ITEMS
+        assert message["tool_calls_truncated"] is True
+        assert message["original_tool_call_count"] == _TOOL_CALLS_MAX_ITEMS + 2
+        assert message["tool_call_arguments_truncated"] is True
+        args = message["tool_calls"][0]["function"]["arguments"]
+        assert len(args) < _TOOL_CALL_ARGUMENTS_MAX_CHARS + 200
+        assert "session_search truncated" in args
 
 
 # =========================================================================

@@ -2960,7 +2960,14 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        # ``last_prompt_tokens`` is the current prompt/context pressure. It is
+        # intentionally distinct from cumulative session token usage. Falling
+        # back to ``usage["total"]`` made the desktop/TUI status bar render
+        # impossible labels like ``22.4M/272k`` after long sessions: the
+        # numerator was lifetime spend, the denominator was context length.
+        ctx_used = getattr(comp, "last_prompt_tokens", 0) or 0
+        if ctx_used < 0:
+            ctx_used = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max:
             usage["context_used"] = ctx_used
