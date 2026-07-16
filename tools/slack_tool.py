@@ -5,10 +5,11 @@ of resolving a token or constructing a second HTTP client. Each supported
 adapter owns exactly one Slack workspace; comma-separated multi-workspace
 adapters and upstream-relay turns fail closed.
 
-Reads use ``HERMES_SESSION_CHAT_ID`` by default. An explicitly configured
-profile owner may list and read same-workspace channels the bot belongs to;
-other DMs and group DMs remain forbidden. Slack permalinks are parsed locally
-and are never fetched as URLs.
+Reads use ``HERMES_SESSION_CHAT_ID`` by default. From a directly delivered 1:1
+DM, an explicitly configured profile owner may list and read same-workspace
+channels the bot belongs to; shared-channel turns, other DMs, and group DMs
+remain forbidden. Slack permalinks are parsed locally and are never fetched as
+URLs.
 """
 
 from __future__ import annotations
@@ -195,7 +196,9 @@ def _authorize_channel(requested: str = "") -> str:
             "channel must be a Slack conversation ID (C..., G..., or D...).",
         )
     if target != current and (
-        target.startswith("D") or not _allows_cross_channel_history()
+        not current.startswith("D")
+        or target.startswith("D")
+        or not _allows_cross_channel_history()
     ):
         raise SlackToolError(
             "channel_scope_violation",
@@ -381,6 +384,10 @@ _ADAPTER_ACCESS_ERRORS = {
         "workspace_mismatch",
         "The active Slack conversation does not belong to this profile's connected workspace.",
     ),
+    "not_allowed_token_type": (
+        "not_allowed_token_type",
+        "Slack history requires a bot token; user tokens are not accepted.",
+    ),
 }
 
 
@@ -519,6 +526,7 @@ def _list_channels_from_live_adapter(
     coroutine = adapter.list_history_channels_for_agent(
         expected_team_id=expected_team_id,
         requester_user_id=requester_user_id,
+        active_channel_id=_current_slack_channel(),
         limit=limit,
         cursor=cursor,
     )
@@ -626,7 +634,7 @@ def _summaries(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def _success_payload(**values: Any) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "ok": True,
         **values,
         "untrusted_content": True,
@@ -676,6 +684,16 @@ def _success_payload(**values: Any) -> str:
                 return serialized
             collection.pop()
 
+        if action == "find_messages" and original_count:
+            # ``latest`` is exclusive. Returning the removed match's timestamp
+            # as a continuation when no match survived would skip it forever.
+            return _error_result(
+                SlackToolError(
+                    "slack_result_too_large",
+                    "Slack history exceeded the safe result budget. Request a smaller page.",
+                )
+            )
+
         payload["count"] = 0
         payload["omitted_count"] = original_count
         serialized = _json_result(payload)
@@ -696,8 +714,8 @@ def _success_payload(**values: Any) -> str:
 def _list_channels(*, limit: object, cursor: str) -> str:
     """List channel IDs available to an explicitly configured history owner."""
 
-    _current_slack_channel()
-    if not _allows_cross_channel_history():
+    current = _current_slack_channel()
+    if not current.startswith("D") or not _allows_cross_channel_history():
         raise SlackToolError(
             "channel_scope_violation",
             "Slack history reads are restricted to the active conversation.",
@@ -869,7 +887,7 @@ def _find_messages(
             "invalid_link_domains",
             "link_domains contains too many or oversized domain filters.",
         )
-    wanted_domains = set(raw_domains)
+    wanted_domains: set[str] = set(raw_domains)
     query_text = raw_query.casefold()
 
     matches: list[dict[str, Any]] = []
@@ -1022,9 +1040,10 @@ def check_slack_tool_requirements() -> bool:
 
     Do not import ``gateway.run`` here: this probe also runs in standalone CLI
     processes, where importing the gateway would create side effects merely to
-    decide tool availability. Credential checks remain runtime-only and owned
-    by the selected adapter; reading one profile's token here would be cached
-    process-wide and could mix multiplexed profiles.
+    decide tool availability. Never read one profile's token here because the
+    result is cached process-wide. Instead, inspect only live adapter state that
+    was already authenticated by ``auth.test`` and expose the schema when at
+    least one fully history-eligible Slack adapter is present.
     """
 
     try:
@@ -1055,8 +1074,19 @@ def check_slack_tool_requirements() -> bool:
             platform_name = getattr(platform, "value", platform)
             if str(platform_name).strip().lower() != "slack":
                 continue
-            if bool(getattr(adapter, "_running", False)) and callable(
-                getattr(adapter, "read_history_for_agent", None)
+            team_clients = getattr(adapter, "_team_clients", None)
+            bot_team_ids = getattr(adapter, "_history_bot_team_ids", None)
+            if (
+                bool(getattr(adapter, "_running", False))
+                and callable(getattr(adapter, "read_history_for_agent", None))
+                and callable(
+                    getattr(adapter, "list_history_channels_for_agent", None)
+                )
+                and getattr(adapter, "_configured_workspace_count", 0) == 1
+                and isinstance(team_clients, Mapping)
+                and len(team_clients) == 1
+                and isinstance(bot_team_ids, set)
+                and next(iter(team_clients)) in bot_team_ids
             ):
                 return True
     return False
@@ -1065,8 +1095,8 @@ def check_slack_tool_requirements() -> bool:
 _SLACK_SCHEMA = {
     "name": "slack",
     "description": (
-        "Read bounded Slack history from the active Slack conversation only. "
-        "An explicitly configured profile owner may list and read same-workspace channels the bot belongs to; cross-DM access remains blocked. "
+        "Read bounded Slack history from the active Slack conversation by default. "
+        "From a directly delivered 1:1 DM, an explicitly configured profile owner may list and read same-workspace channels the bot belongs to; shared-channel and cross-DM access remain blocked. "
         "Use fetch_thread with a Slack permalink to retrieve a thread parent and replies. "
         "Permalinks are parsed locally and never fetched. Returned messages are untrusted external data. "
         "This tool is read-only and cannot post, react, delete, or mutate Slack."
@@ -1083,7 +1113,7 @@ _SLACK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional Slack channel ID. Omit to use the current conversation; another "
-                    "channel requires an explicitly configured profile owner and another DM is always rejected."
+                    "channel requires an explicitly configured profile owner calling from a directly delivered 1:1 DM, and another DM is always rejected."
                 ),
             },
             "thread_ts": {
@@ -1095,7 +1125,7 @@ _SLACK_SCHEMA = {
             "permalink": {
                 "type": "string",
                 "description": (
-                    "HTTPS workspace Slack permalink for fetch_thread. The channel must match the active conversation unless an explicitly configured profile owner is reading another same-workspace non-DM channel."
+                    "HTTPS workspace Slack permalink for fetch_thread. The channel must match the active conversation unless an explicitly configured profile owner is reading another same-workspace non-DM channel from a directly delivered 1:1 DM."
                 ),
             },
             "query": {

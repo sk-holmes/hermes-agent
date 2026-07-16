@@ -55,6 +55,10 @@ def _install_live_gateway_runner(monkeypatch):
     adapter = SimpleNamespace(
         _running=True,
         read_history_for_agent=lambda **_kwargs: None,
+        list_history_channels_for_agent=lambda **_kwargs: None,
+        _configured_workspace_count=1,
+        _team_clients={"T1": object()},
+        _history_bot_team_ids={"T1"},
     )
     runner = SimpleNamespace(
         _gateway_loop=FakeLoop(),
@@ -140,7 +144,7 @@ def test_other_channel_is_blocked_before_adapter_access(monkeypatch):
 def test_configured_owner_can_read_another_same_workspace_channel(monkeypatch):
     mapping = {
         "HERMES_SESSION_PLATFORM": "slack",
-        "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+        "HERMES_SESSION_CHAT_ID": "D123456789",
         "HERMES_SESSION_SCOPE_ID": "T1",
         "HERMES_SESSION_PROFILE": "default",
         "HERMES_SESSION_USER_ID": "U_OWNER",
@@ -161,6 +165,37 @@ def test_configured_owner_can_read_another_same_workspace_channel(monkeypatch):
 
     assert result["ok"] is True
     assert calls[0]["channel_id"] == OTHER_CHANNEL_ID
+
+
+def test_configured_owner_cannot_read_cross_channel_from_shared_channel(monkeypatch):
+    mapping = {
+        "HERMES_SESSION_PLATFORM": "slack",
+        "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+        "HERMES_SESSION_SCOPE_ID": "T1",
+        "HERMES_SESSION_PROFILE": "default",
+        "HERMES_SESSION_USER_ID": "U_OWNER",
+    }
+    monkeypatch.setattr(
+        slack_tool,
+        "get_session_env",
+        lambda name, default="": mapping.get(name, default),
+    )
+    runner = _install_live_gateway_runner(monkeypatch)
+    adapter = next(iter(runner.adapters.values()))
+    adapter.allows_agent_cross_channel_history = lambda _user_id: True
+    monkeypatch.setattr(
+        slack_tool,
+        "_read_from_live_adapter",
+        lambda *_args, **_kwargs: pytest.fail(
+            "shared-channel cross-channel reads must not reach Slack"
+        ),
+    )
+
+    result = json.loads(
+        slack_tool.slack(action="fetch_history", channel=OTHER_CHANNEL_ID)
+    )
+
+    assert result["code"] == "channel_scope_violation"
 
 
 def test_cross_channel_dm_stays_blocked_for_configured_owner(monkeypatch):
@@ -193,7 +228,7 @@ def test_cross_channel_dm_stays_blocked_for_configured_owner(monkeypatch):
 def test_configured_owner_can_list_same_workspace_channels(monkeypatch):
     mapping = {
         "HERMES_SESSION_PLATFORM": "slack",
-        "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+        "HERMES_SESSION_CHAT_ID": "D123456789",
         "HERMES_SESSION_SCOPE_ID": "T1",
         "HERMES_SESSION_PROFILE": "default",
         "HERMES_SESSION_USER_ID": "U_OWNER",
@@ -451,6 +486,47 @@ def test_fetch_thread_defaults_to_active_thread_and_preserves_cursor(monkeypatch
     assert calls[0]["limit"] == 50
 
 
+def test_fetch_thread_local_truncation_retries_same_page_without_cursor(monkeypatch):
+    mapping = {
+        "HERMES_SESSION_PLATFORM": "slack",
+        "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+        "HERMES_SESSION_THREAD_ID": THREAD_TS,
+    }
+    monkeypatch.setattr(
+        slack_tool,
+        "get_session_env",
+        lambda name, default="": mapping.get(name, default),
+    )
+    _reader(
+        monkeypatch,
+        {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": f"1783909752.{index:06d}",
+                    "text": "thread reply " + ("x" * 2_000),
+                }
+                for index in range(50)
+            ],
+            "has_more": True,
+            "response_metadata": {"next_cursor": "remote-next-page"},
+        },
+    )
+
+    raw_result = slack_tool.slack(action="fetch_thread", limit=50)
+    result = json.loads(raw_result)
+
+    assert len(raw_result) <= slack_tool._MAX_SERIALIZED_RESULT_CHARS
+    assert result["ok"] is True
+    assert result["result_truncated"] is True
+    assert result["count"] == len(result["messages"])
+    assert result["omitted_count"] == 50 - result["count"]
+    assert result["messages"]
+    assert result["has_more"] is True
+    assert result["retry_same_page_with_smaller_limit"] is True
+    assert "next_cursor" not in result
+
+
 def test_find_messages_query_only_has_no_implicit_x_filter(monkeypatch):
     calls = _reader(
         monkeypatch,
@@ -589,6 +665,30 @@ def test_find_messages_scan_is_bounded_to_three_pages(monkeypatch):
     assert len(calls) == 3
 
 
+def test_find_messages_forwards_cursor_until_later_page_match(monkeypatch):
+    calls = _reader(
+        monkeypatch,
+        {
+            "ok": True,
+            "messages": [{"ts": "3.000001", "text": "not present"}],
+            "response_metadata": {"next_cursor": "page-two"},
+        },
+        {
+            "ok": True,
+            "messages": [{"ts": "2.000001", "text": "needle on page two"}],
+            "response_metadata": {"next_cursor": ""},
+        },
+    )
+
+    result = json.loads(
+        slack_tool.slack(action="find_messages", query="needle", max_pages=2)
+    )
+
+    assert result["count"] == 1
+    assert result["matches"][0]["ts"] == "2.000001"
+    assert [call["cursor"] for call in calls] == ["", "page-two"]
+
+
 def test_message_text_and_urls_are_independently_bounded(monkeypatch):
     long_text = "x" * 2_500 + " https://example.com/full-text-url"
     _reader(
@@ -698,10 +798,37 @@ def test_find_messages_local_truncation_returns_advancing_continuation(monkeypat
     )
 
 
+def test_find_messages_never_skips_only_match_when_local_budget_retains_zero(
+    monkeypatch,
+):
+    monkeypatch.setattr(slack_tool, "_MAX_SERIALIZED_RESULT_CHARS", 700)
+    _reader(
+        monkeypatch,
+        {
+            "ok": True,
+            "messages": [
+                {
+                    "ts": "1783909752.000001",
+                    "text": "needle " + ("x" * 1_500),
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        },
+    )
+
+    result = json.loads(slack_tool.slack(action="find_messages", query="needle"))
+
+    assert result == {
+        "ok": False,
+        "error": "Slack history exceeded the safe result budget. Request a smaller page.",
+        "code": "slack_result_too_large",
+    }
+
+
 def test_list_channels_local_truncation_suppresses_next_cursor(monkeypatch):
     mapping = {
         "HERMES_SESSION_PLATFORM": "slack",
-        "HERMES_SESSION_CHAT_ID": CHANNEL_ID,
+        "HERMES_SESSION_CHAT_ID": "D123456789",
         "HERMES_SESSION_SCOPE_ID": "T1",
         "HERMES_SESSION_USER_ID": "U_OWNER",
     }
@@ -973,6 +1100,74 @@ def test_sync_tool_bridge_runs_sdk_call_on_gateway_loop(monkeypatch):
     assert adapter.seen_kwargs["expected_team_id"] == "T1"
 
 
+def test_public_list_channels_bridge_forwards_workspace_actor_and_dm(monkeypatch):
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        ready.set()
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+
+    class FakeAdapter:
+        seen_loop = None
+        seen_kwargs = None
+
+        def allows_agent_cross_channel_history(self, user_id):
+            return user_id == "U_OWNER"
+
+        async def list_history_channels_for_agent(self, **kwargs):
+            self.seen_loop = asyncio.get_running_loop()
+            self.seen_kwargs = kwargs
+            return {
+                "ok": True,
+                "channels": [
+                    {
+                        "id": OTHER_CHANNEL_ID,
+                        "name": "other",
+                        "is_member": True,
+                        "is_private": False,
+                    }
+                ],
+                "response_metadata": {"next_cursor": ""},
+            }
+
+    mapping = {
+        "HERMES_SESSION_PLATFORM": "slack",
+        "HERMES_SESSION_CHAT_ID": "D123456789",
+        "HERMES_SESSION_SCOPE_ID": "T1",
+        "HERMES_SESSION_USER_ID": "U_OWNER",
+    }
+    adapter = FakeAdapter()
+    monkeypatch.setattr(
+        slack_tool,
+        "get_session_env",
+        lambda name, default="": mapping.get(name, default),
+    )
+    monkeypatch.setattr(
+        slack_tool,
+        "_live_adapter_and_loop",
+        lambda: (adapter, loop),
+    )
+    try:
+        result = json.loads(slack_tool.slack(action="list_channels"))
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+    assert result["ok"] is True
+    assert adapter.seen_loop is loop
+    assert adapter.seen_kwargs is not None
+    assert adapter.seen_kwargs["expected_team_id"] == "T1"
+    assert adapter.seen_kwargs["requester_user_id"] == "U_OWNER"
+    assert adapter.seen_kwargs["active_channel_id"] == "D123456789"
+
+
 def test_gateway_loop_scheduling_race_closes_coroutine_and_sanitizes_error(
     monkeypatch,
 ):
@@ -1075,6 +1270,7 @@ async def test_adapter_read_service_reuses_single_workspace_client():
     adapter._running = True
     adapter._app = SimpleNamespace(client=primary)
     adapter._team_clients = {"T1": workspace}
+    adapter._history_bot_team_ids = {"T1"}
     adapter._configured_workspace_count = 1
     adapter._channel_team = {CHANNEL_ID: "T1"}
     adapter.config = PlatformConfig(enabled=True, token="xoxb-test")
@@ -1220,6 +1416,7 @@ async def test_adapter_allowed_channel_policy_fails_before_sdk_call():
     adapter._running = True
     adapter._app = SimpleNamespace(client=client)
     adapter._team_clients = {"T1": client}
+    adapter._history_bot_team_ids = {"T1"}
     adapter._configured_workspace_count = 1
     adapter._channel_team = {}
     adapter.config = PlatformConfig(
@@ -1253,6 +1450,23 @@ def test_check_fn_is_profile_neutral_and_does_not_read_token(monkeypatch):
     assert slack_tool.check_slack_tool_requirements() is True
 
 
+@pytest.mark.parametrize("failure", ["multi_workspace", "user_token", "no_client"])
+def test_check_fn_rejects_history_ineligible_adapters(monkeypatch, failure):
+    monkeypatch.setattr(slack_tool.importlib.util, "find_spec", lambda name: object())
+    runner = _install_live_gateway_runner(monkeypatch)
+    adapter = next(iter(runner.adapters.values()))
+    if failure == "multi_workspace":
+        adapter._configured_workspace_count = 2
+        adapter._team_clients = {"T1": object(), "T2": object()}
+        adapter._history_bot_team_ids = {"T1", "T2"}
+    elif failure == "user_token":
+        adapter._history_bot_team_ids = set()
+    else:
+        adapter._team_clients = {}
+
+    assert slack_tool.check_slack_tool_requirements() is False
+
+
 def test_check_fn_and_all_tools_schema_require_live_gateway_adapter(monkeypatch):
     monkeypatch.setattr(slack_tool.importlib.util, "find_spec", lambda name: object())
 
@@ -1273,7 +1487,7 @@ def test_check_fn_and_all_tools_schema_require_live_gateway_adapter(monkeypatch)
     assert "slack" not in schema_names
 
 
-def test_schema_is_read_only_and_current_conversation_scoped(monkeypatch):
+def test_schema_is_read_only_and_documents_dm_only_owner_exception(monkeypatch):
     monkeypatch.setattr(slack_tool.importlib.util, "find_spec", lambda name: object())
     _install_live_gateway_runner(monkeypatch)
 
@@ -1296,7 +1510,9 @@ def test_schema_is_read_only_and_current_conversation_scoped(monkeypatch):
         "find_messages",
     ]
     assert "post_message" not in properties["action"]["enum"]
-    assert "active Slack conversation only" in schema["function"]["description"]
+    description = schema["function"]["description"]
+    assert "active Slack conversation by default" in description
+    assert "directly delivered 1:1 DM" in description
 
     entry = slack_tool.registry.get_entry("slack")
     assert entry is not None

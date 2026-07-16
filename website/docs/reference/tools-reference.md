@@ -251,7 +251,7 @@ workspace token; comma-separated multi-workspace adapters fail closed.
 
 | Tool | Description | Requires |
 |------|-------------|----------|
-| `slack` | Read bounded history from the **active conversation only**. `fetch_history` reads the channel timeline, `fetch_thread` reads a parent and replies via `conversations.replies` (including from a Slack permalink), and `find_messages` performs a bounded text/domain filter. Other channels and other users' DMs are rejected before an API call. Results are marked as untrusted external data. The tool cannot post, react, delete, or otherwise mutate Slack. | A live Slack gateway adapter plus the matching history scopes |
+| `slack` | Read bounded history from the **active conversation by default**. `fetch_history` reads the channel timeline, `fetch_thread` reads a parent and replies via `conversations.replies` (including from a Slack permalink), and `find_messages` performs a bounded text/domain filter. From a directly delivered 1:1 DM, an explicitly configured profile owner may list and read same-workspace channels the bot belongs to; shared-channel turns and other users' DMs cannot use that exception. Results are marked as untrusted external data. The tool cannot post, react, delete, or otherwise mutate Slack. | A live Slack gateway adapter using a bot token plus the matching history scopes |
 
 ## `spotify` toolset
 

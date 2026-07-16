@@ -1234,6 +1234,11 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["history_cross_channel_user_ids"] = platform_cfg[
                         "history_cross_channel_user_ids"
                     ]
+                if plat == Platform.SLACK and "allowed_channels" in platform_cfg:
+                    # Keep the history allowlist on the selected profile's
+                    # PlatformConfig. A YAML→process-env bridge would leak one
+                    # multiplex profile's channels into every Slack adapter.
+                    bridged["allowed_channels"] = platform_cfg["allowed_channels"]
                 if plat == Platform.TELEGRAM and "allowed_chats" in platform_cfg:
                     bridged["allowed_chats"] = platform_cfg["allowed_chats"]
                 if plat == Platform.TELEGRAM and "group_allowed_chats" in platform_cfg:

@@ -376,6 +376,65 @@ def direct_slack_provenance_scope(direct: bool):
         _SESSION_DIRECT_SLACK.reset(token)
 
 
+@contextmanager
+def session_identity_scope(
+    *,
+    platform: str = "",
+    source: str = "",
+    chat_id: str = "",
+    chat_name: str = "",
+    user_id: str = "",
+    user_name: str = "",
+    thread_id: str = "",
+    message_id: str = "",
+    session_key: str = "",
+    session_id: str = "",
+    profile: str = "",
+    scope_id: str = "",
+    direct_slack: bool = False,
+    async_delivery: bool = True,
+):
+    """Temporarily rebind a complete queued-turn identity.
+
+    Queued follow-ups recurse inside the original gateway task. Rebinding only
+    one capability bit leaves the prior actor's user ID and other authorization
+    metadata visible to tools. This token-based scope replaces every
+    security-relevant session value for the recursive turn and restores the
+    outer turn exactly while unwinding.
+    """
+
+    global _session_context_engaged
+    _session_context_engaged = True
+    values = {
+        "HERMES_SESSION_PLATFORM": str(platform or ""),
+        "HERMES_SESSION_SOURCE": str(source or ""),
+        "HERMES_SESSION_CHAT_ID": str(chat_id or ""),
+        "HERMES_SESSION_CHAT_NAME": str(chat_name or ""),
+        "HERMES_SESSION_USER_ID": str(user_id or ""),
+        "HERMES_SESSION_USER_NAME": str(user_name or ""),
+        "HERMES_SESSION_THREAD_ID": str(thread_id or ""),
+        "HERMES_SESSION_MESSAGE_ID": str(message_id or ""),
+        "HERMES_SESSION_KEY": str(session_key or ""),
+        "HERMES_SESSION_ID": str(session_id or ""),
+        "HERMES_SESSION_PROFILE": str(profile or ""),
+        "HERMES_SESSION_SCOPE_ID": str(scope_id or ""),
+    }
+    tokens = [
+        (var, var.set(value))
+        for name, value in values.items()
+        if (var := _VAR_MAP.get(name)) is not None
+    ]
+    direct_token = _SESSION_DIRECT_SLACK.set(bool(direct_slack))
+    async_token = _SESSION_ASYNC_DELIVERY.set(bool(async_delivery))
+    try:
+        yield
+    finally:
+        _SESSION_ASYNC_DELIVERY.reset(async_token)
+        _SESSION_DIRECT_SLACK.reset(direct_token)
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.
 

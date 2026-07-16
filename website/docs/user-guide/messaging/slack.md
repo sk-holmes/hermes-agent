@@ -368,11 +368,12 @@ rejected for history reads. Serve one Slack bot token per profile instead.
 
 History responses cap message text per result to keep tool output bounded. URLs are still extracted from the full Slack message text before truncation.
 
-History reads are always restricted to the current inbound channel or DM. A
+History reads are restricted to the current inbound channel or DM by default. A
 permalink for another channel, an arbitrary channel ID, and another user's DM
-are rejected before Hermes calls Slack. Bot visibility is not treated as user
-authorization. Retrieved message text is also wrapped as untrusted external
-data so instructions inside channel history do not become agent instructions.
+are rejected before Hermes calls Slack unless the owner-only 1:1-DM exception
+below applies. Bot visibility is not treated as user authorization. Retrieved
+message text is also wrapped as untrusted external data so instructions inside
+channel history do not become agent instructions.
 The inbound turn must come directly from the local Slack adapter; Slack turns
 delivered through an upstream relay cannot borrow a local adapter credential.
 
@@ -380,7 +381,7 @@ delivered through an upstream relay cannot borrow a local adapter credential.
 
 The active-conversation boundary is the default for every Slack user. A profile
 owner can opt in to reading **other same-workspace channels the bot already
-belongs to**, without granting that ability to any other Slack user:
+belongs to**, but only while talking to Hermes in a directly delivered 1:1 DM:
 
 ```yaml
 slack:
@@ -388,11 +389,13 @@ slack:
     - "U01ABC2DEF3" # Slack Member ID of the profile owner
 ```
 
-This setting is profile-local and has no environment fallback. It permits the
-named owner to use `list_channels` and then read a listed public or private
-channel in that same workspace. It never permits cross-workspace reads,
-other-user DMs, relayed/synthetic/background turns, writes, reactions, or
-deletions. An empty, missing, or malformed list preserves the strict
+This setting is profile-local and has no environment fallback. From a 1:1 DM,
+it permits the named owner to use `list_channels` and then read a listed public
+or private channel in that same workspace. Shared channels and threads cannot
+use the exception, because the retrieved content could be exposed to another
+participant. It never permits cross-workspace reads, other-user DMs,
+relayed/synthetic/background turns, writes, reactions, or deletions. An empty,
+missing, or malformed list preserves the strict
 active-conversation-only behavior. The bot must be a member of every listed
 channel; private-channel discovery also requires Slack's `groups:read` scope.
 

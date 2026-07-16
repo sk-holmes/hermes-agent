@@ -41,3 +41,31 @@ def test_missing_slack_history_owner_list_does_not_create_a_cross_channel_grant(
     config = _load_with_yaml_dict({"slack": {"require_mention": True}})
 
     assert "history_cross_channel_user_ids" not in config.platforms[Platform.SLACK].extra
+
+
+def test_top_level_slack_allowed_channels_is_profile_local(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_PROCESS_GLOBAL")
+
+    config = _load_with_yaml_dict({"slack": {"allowed_channels": ["C_PROFILE_A"]}})
+
+    assert config.platforms[Platform.SLACK].extra["allowed_channels"] == [
+        "C_PROFILE_A"
+    ]
+
+
+def test_nested_slack_allowed_channels_is_profile_local(monkeypatch):
+    monkeypatch.setenv("SLACK_ALLOWED_CHANNELS", "C_PROCESS_GLOBAL")
+
+    config = _load_with_yaml_dict(
+        {
+            "gateway": {
+                "platforms": {
+                    "slack": {"allowed_channels": ["C_PROFILE_B"]},
+                }
+            }
+        }
+    )
+
+    assert config.platforms[Platform.SLACK].extra["allowed_channels"] == [
+        "C_PROFILE_B"
+    ]

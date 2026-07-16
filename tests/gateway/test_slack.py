@@ -115,6 +115,7 @@ def adapter():
     a._app.client = AsyncMock()
     a._bot_user_id = "U_BOT"
     a._running = True
+    a._history_bot_team_ids = {"T1"}
     # Capture events instead of processing them
     a.handle_message = AsyncMock()
     return a
@@ -141,7 +142,7 @@ class TestAgentHistoryCrossChannelAuthorization:
         result = await adapter.read_history_for_agent(
             channel_id="C999999999",
             expected_team_id="T1",
-            active_channel_id="C123456789",
+            active_channel_id="D123456789",
             requester_user_id="U12345678",
         )
 
@@ -187,7 +188,7 @@ class TestAgentHistoryCrossChannelAuthorization:
             await adapter.read_history_for_agent(
                 channel_id="C_DENIED",
                 expected_team_id="T1",
-                active_channel_id="C_ACTIVE",
+                active_channel_id="D_ACTIVE",
                 requester_user_id="U12345678",
             )
 
@@ -232,7 +233,7 @@ class TestAgentHistoryCrossChannelAuthorization:
             await adapter.read_history_for_agent(
                 channel_id="G999999999",
                 expected_team_id="T1",
-                active_channel_id="C123456789",
+                active_channel_id="D123456789",
                 requester_user_id="U12345678",
             )
 
@@ -260,7 +261,7 @@ class TestAgentHistoryCrossChannelAuthorization:
         result = await adapter.read_history_for_agent(
             channel_id="G123456789",
             expected_team_id="T1",
-            active_channel_id="C123456789",
+            active_channel_id="D123456789",
             requester_user_id="U12345678",
         )
 
@@ -309,10 +310,30 @@ class TestAgentHistoryCrossChannelAuthorization:
             await adapter.read_history_for_agent(
                 channel_id="C999999999",
                 expected_team_id="T1",
+                active_channel_id="D123456789",
+                requester_user_id="U12345678",
+            )
+
+        client.conversations_history.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_configured_owner_cannot_cross_channel_from_shared_channel(
+        self, adapter
+    ):
+        client = AsyncMock()
+        adapter._team_clients = {"T1": client}
+        adapter._configured_workspace_count = 1
+        adapter.config.extra["history_cross_channel_user_ids"] = ["U12345678"]
+
+        with pytest.raises(SlackHistoryAccessError, match="cross_channel_not_allowed"):
+            await adapter.read_history_for_agent(
+                channel_id="C999999999",
+                expected_team_id="T1",
                 active_channel_id="C123456789",
                 requester_user_id="U12345678",
             )
 
+        client.conversations_info.assert_not_awaited()
         client.conversations_history.assert_not_awaited()
 
 
@@ -435,6 +456,7 @@ class TestAppMentionHandler:
         mock_app.client = AsyncMock()
         mock_app.client.auth_test = AsyncMock(
             return_value={
+                "bot_id": "B_TEST",
                 "user_id": "U_BOT",
                 "user": "testbot",
             }
@@ -444,6 +466,7 @@ class TestAppMentionHandler:
         mock_web_client = AsyncMock()
         mock_web_client.auth_test = AsyncMock(
             return_value={
+                "bot_id": "B_TEST",
                 "user_id": "U_BOT",
                 "user": "testbot",
                 "team_id": "T_FAKE",
@@ -543,6 +566,70 @@ class TestAppMentionHandler:
             {"team_id": "T_EXTERNAL", "file_id": "F123"},
             installation_team_id="T_FAKE",
         )
+
+
+@pytest.mark.asyncio
+async def test_connected_user_token_cannot_enable_agent_history_before_api_calls():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxp-user-token"))
+    adapter.config.extra["history_cross_channel_user_ids"] = ["U_OWNER"]
+
+    def _noop_decorator(_event_or_command):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    mock_app = MagicMock()
+    mock_app.event = _noop_decorator
+    mock_app.command = _noop_decorator
+    mock_app.action = _noop_decorator
+    mock_app.client = AsyncMock()
+
+    mock_web_client = AsyncMock()
+    mock_web_client.auth_test = AsyncMock(
+        return_value={
+            "user_id": "U_HUMAN",
+            "user": "human",
+            "team_id": "T_FAKE",
+            "team": "FakeTeam",
+        }
+    )
+    socket_mode_handler = MagicMock()
+    socket_mode_handler.start_async = AsyncMock(return_value=None)
+
+    with (
+        patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+        patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
+        patch.object(
+            _slack_mod,
+            "AsyncSocketModeHandler",
+            return_value=socket_mode_handler,
+        ),
+        patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
+        patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
+        patch("asyncio.create_task", side_effect=_fake_create_task),
+    ):
+        assert await adapter.connect() is True
+
+    assert adapter._history_bot_team_ids == set()
+    with pytest.raises(SlackHistoryAccessError, match="not_allowed_token_type"):
+        await adapter.read_history_for_agent(
+            channel_id="D123456789",
+            expected_team_id="T_FAKE",
+            active_channel_id="D123456789",
+            requester_user_id="U_OWNER",
+        )
+    with pytest.raises(SlackHistoryAccessError, match="not_allowed_token_type"):
+        await adapter.list_history_channels_for_agent(
+            expected_team_id="T_FAKE",
+            requester_user_id="U_OWNER",
+            active_channel_id="D123456789",
+        )
+
+    mock_web_client.conversations_info.assert_not_awaited()
+    mock_web_client.conversations_history.assert_not_awaited()
+    mock_web_client.conversations_replies.assert_not_awaited()
+    mock_web_client.conversations_list.assert_not_awaited()
 
 
 class TestSlackConnectCleanup:
@@ -838,12 +925,15 @@ class TestSlackSocketWatchdog:
             assert await adapter.connect() is True
             assert len(instances) == 1
 
+            adapter._history_bot_team_ids = {"T_FAKE"}
+
             await adapter.disconnect()
 
             assert adapter._handler is None
             assert adapter._socket_mode_task is None
             assert adapter._socket_watchdog_task is None
             assert adapter._configured_workspace_count == 0
+            assert adapter._history_bot_team_ids == set()
             assert instances[0].closed is True
 
             for _ in range(10):

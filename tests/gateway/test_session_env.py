@@ -11,6 +11,7 @@ from gateway.session_context import (
     direct_slack_session,
     get_session_env,
     reset_session_vars,
+    session_identity_scope,
     set_session_vars,
     clear_session_vars,
 )
@@ -164,6 +165,46 @@ def test_direct_slack_provenance_scope_is_stack_safe():
             with direct_slack_provenance_scope(True):
                 assert direct_slack_session() is True
             assert direct_slack_session() is False
+        assert direct_slack_session() is True
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_session_identity_scope_rebinds_queued_actor_and_restores_outer_turn():
+    tokens = set_session_vars(
+        platform="slack",
+        chat_id="C_SHARED",
+        scope_id="T1",
+        thread_id="171.000001",
+        user_id="U_OWNER",
+        user_name="owner",
+        session_key="agent:main:slack:thread:C_SHARED:171.000001",
+        session_id="session-1",
+        message_id="owner-message",
+        profile="default",
+        direct_slack=True,
+    )
+    try:
+        with session_identity_scope(
+            platform="slack",
+            chat_id="C_SHARED",
+            scope_id="T1",
+            thread_id="171.000001",
+            user_id="U_OTHER",
+            user_name="other",
+            session_key="agent:main:slack:thread:C_SHARED:171.000001",
+            session_id="session-1",
+            message_id="queued-message",
+            profile="default",
+            direct_slack=True,
+        ):
+            assert get_session_env("HERMES_SESSION_USER_ID") == "U_OTHER"
+            assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "queued-message"
+            assert get_session_env("HERMES_SESSION_CHAT_ID") == "C_SHARED"
+            assert direct_slack_session() is True
+
+        assert get_session_env("HERMES_SESSION_USER_ID") == "U_OWNER"
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "owner-message"
         assert direct_slack_session() is True
     finally:
         clear_session_vars(tokens)

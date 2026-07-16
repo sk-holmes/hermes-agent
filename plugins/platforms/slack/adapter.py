@@ -465,6 +465,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
+        # Only teams whose auth.test response proves a bot token may serve the
+        # agent-facing history seam. User tokens expose the human principal's
+        # memberships and would defeat the bot-membership boundary.
+        self._history_bot_team_ids: set[str] = set()
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
         # Published only after connect() finishes authentication and starts
         # Socket Mode. The agent-facing history seam checks this together with
@@ -1087,6 +1091,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._history_bot_team_ids = set()
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
@@ -1105,6 +1110,8 @@ class SlackAdapter(BasePlatformAdapter):
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
+                if auth_response.get("bot_id"):
+                    self._history_bot_team_ids.add(team_id)
 
                 # First token always wins as the primary bot user id; we
                 # cleared ``_bot_user_id`` above so this picks up the current
@@ -1407,6 +1414,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Disconnect from Slack."""
         self._running = False
         self._configured_workspace_count = 0
+        self._history_bot_team_ids = set()
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
@@ -1506,10 +1514,10 @@ class SlackAdapter(BasePlatformAdapter):
         """Read bounded history with this adapter's workspace-specific client.
 
         The model-facing ``slack`` tool is current-channel only by default. A
-        profile may name explicit Slack owners who can read another same-
-        workspace channel, never another DM. This adapter repeats that check
-        immediately before Slack SDK access so a tool-layer regression cannot
-        bypass the transport boundary.
+        profile may name explicit Slack owners who, from a directly delivered
+        1:1 DM, can read another same-workspace channel, never another DM. This
+        adapter repeats that check immediately before Slack SDK access so a
+        tool-layer regression cannot bypass the transport boundary.
 
         A single adapter may also be configured with several workspace tokens.
         That topology is deliberately unsupported here: without a stable
@@ -1528,6 +1536,8 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = self._resolve_installation_team_id(expected_team_id)
         if not team_id or team_id != next(iter(self._team_clients)):
             raise SlackHistoryAccessError("workspace_mismatch")
+        if team_id not in self._history_bot_team_ids:
+            raise SlackHistoryAccessError("not_allowed_token_type")
         client = self._team_clients[team_id]
         allowed_channels = self._slack_allowed_channels()
         if (
@@ -1538,8 +1548,10 @@ class SlackAdapter(BasePlatformAdapter):
             raise SlackHistoryAccessError("channel_not_allowed")
 
         if active_channel_id and channel_id != active_channel_id:
-            if channel_id.startswith("D") or not self.allows_agent_cross_channel_history(
-                requester_user_id
+            if (
+                not active_channel_id.startswith("D")
+                or channel_id.startswith("D")
+                or not self.allows_agent_cross_channel_history(requester_user_id)
             ):
                 raise SlackHistoryAccessError("cross_channel_not_allowed")
             # MPIM/group-DM IDs share the G... namespace with legacy private
@@ -1585,10 +1597,11 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         expected_team_id: str,
         requester_user_id: str,
+        active_channel_id: str,
         limit: int = 50,
         cursor: str = "",
     ) -> Dict[str, Any]:
-        """List member C/G channels for an explicitly configured history owner."""
+        """List member C/G channels for an owner calling from a 1:1 DM."""
 
         if not self._running or not self._app:
             raise SlackHistoryAccessError("adapter_unavailable")
@@ -1600,7 +1613,12 @@ class SlackAdapter(BasePlatformAdapter):
         team_id = self._resolve_installation_team_id(expected_team_id)
         if not team_id or team_id != next(iter(self._team_clients)):
             raise SlackHistoryAccessError("workspace_mismatch")
-        if not self.allows_agent_cross_channel_history(requester_user_id):
+        if team_id not in self._history_bot_team_ids:
+            raise SlackHistoryAccessError("not_allowed_token_type")
+        if (
+            not active_channel_id.startswith("D")
+            or not self.allows_agent_cross_channel_history(requester_user_id)
+        ):
             raise SlackHistoryAccessError("cross_channel_not_allowed")
 
         kwargs: Dict[str, Any] = {
@@ -5366,8 +5384,8 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     existing env-driven model and owns the YAML→env translation here, next to
     the adapter that consumes it. Env vars take precedence over YAML — every
     assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    survive a config.yaml update. Security-sensitive channel allowlists are
+    bridged profile-locally by ``gateway.config`` instead of process-wide here.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -5382,11 +5400,6 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
         os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
-    ac = slack_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("SLACK_ALLOWED_CHANNELS"):
-        if isinstance(ac, list):
-            ac = ",".join(str(v) for v in ac)
-        os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
     return None  # all settings flow through env; nothing to merge into extras
 
 
@@ -5423,7 +5436,7 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, allow_bots,
-        # free_response_channels, reactions, allowed_channels) into SLACK_*
+        # free_response_channels, reactions) into SLACK_*
         # env vars that the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,

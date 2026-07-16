@@ -15628,8 +15628,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
-                if entry and getattr(entry, "origin", None):
-                    return session_routing_source(entry.origin)
+                origin = getattr(entry, "origin", None) if entry else None
+                if isinstance(origin, SessionSource):
+                    return session_routing_source(origin)
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -20470,7 +20471,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
-                _followup_adapter = self._adapter_for_source(source)
+                _followup_adapter = self._adapter_for_source(next_source)
                 if _followup_adapter:
                     try:
                         await _followup_adapter.send_typing(
@@ -20496,23 +20497,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                # The recursive follow-up runs inside the original asyncio
-                # task, so it otherwise inherits that turn's ContextVars.  In
-                # particular, a synthetic /goal continuation sourced from a
-                # live Slack turn would retain direct-Slack provenance even
-                # though its detached SessionSource correctly cleared the
-                # wire-invisible bit.  Rebind the positive capability for the
-                # exact follow-up source before executor context is copied.
-                from gateway.session_context import direct_slack_provenance_scope
+                # Recursive follow-ups share the original asyncio task. Rebind
+                # the complete next-turn identity before executor context is
+                # copied so a queued actor cannot inherit the prior actor's
+                # owner authorization or other session metadata.
+                from gateway.session_context import get_session_env, session_identity_scope
 
-                with direct_slack_provenance_scope(
-                    bool(
-                        getattr(
-                            next_source,
-                            "delivered_via_direct_slack_adapter",
-                            False,
-                        )
-                    )
+                with session_identity_scope(
+                    platform=next_source.platform.value,
+                    chat_id=next_source.chat_id,
+                    chat_name=next_source.chat_name or "",
+                    user_id=next_source.user_id or "",
+                    user_name=next_source.user_name or "",
+                    thread_id=next_source.thread_id or "",
+                    message_id=next_message_id or "",
+                    session_key=next_session_key,
+                    session_id=session_id,
+                    profile=get_session_env("HERMES_SESSION_PROFILE", ""),
+                    scope_id=next_source.scope_id or "",
+                    direct_slack=bool(
+                        next_source.delivered_via_direct_slack_adapter
+                    ),
+                    async_delivery=bool(
+                        getattr(_followup_adapter, "supports_async_delivery", True)
+                    ),
                 ):
                     followup_result = await self._run_agent(
                         message=next_message,

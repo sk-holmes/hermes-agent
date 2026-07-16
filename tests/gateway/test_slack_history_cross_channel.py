@@ -17,6 +17,7 @@ def _adapter_with_single_workspace_client() -> tuple[SlackAdapter, AsyncMock]:
     adapter._configured_workspace_count = 1
     client = AsyncMock()
     adapter._team_clients = {"T1": client}
+    adapter._history_bot_team_ids = {"T1"}
     return adapter, client
 
 
@@ -36,6 +37,7 @@ async def test_history_owner_discovers_only_member_channels_not_dms():
     result = await adapter.list_history_channels_for_agent(
         expected_team_id="T1",
         requester_user_id="U12345678",
+        active_channel_id="D123456789",
     )
 
     assert result["channels"] == [
@@ -62,6 +64,7 @@ async def test_non_owner_cannot_discover_channels_before_slack_api_call():
         await adapter.list_history_channels_for_agent(
             expected_team_id="T1",
             requester_user_id="U87654321",
+            active_channel_id="D123456789",
         )
 
     client.conversations_list.assert_not_awaited()
@@ -77,3 +80,29 @@ def test_history_owner_config_rejects_malformed_or_environment_only_ids(monkeypa
     adapter.config.extra["history_cross_channel_user_ids"] = ["U12345678"]
 
     assert adapter.allows_agent_cross_channel_history("U12345678") is True
+
+
+@pytest.mark.asyncio
+async def test_user_token_cannot_access_agent_history_before_slack_api_calls():
+    adapter, client = _adapter_with_single_workspace_client()
+    adapter._history_bot_team_ids = set()
+    adapter.config.extra["history_cross_channel_user_ids"] = ["U12345678"]
+
+    with pytest.raises(SlackHistoryAccessError, match="not_allowed_token_type"):
+        await adapter.read_history_for_agent(
+            channel_id="D123456789",
+            expected_team_id="T1",
+            active_channel_id="D123456789",
+            requester_user_id="U12345678",
+        )
+    with pytest.raises(SlackHistoryAccessError, match="not_allowed_token_type"):
+        await adapter.list_history_channels_for_agent(
+            expected_team_id="T1",
+            requester_user_id="U12345678",
+            active_channel_id="D123456789",
+        )
+
+    client.conversations_info.assert_not_awaited()
+    client.conversations_history.assert_not_awaited()
+    client.conversations_replies.assert_not_awaited()
+    client.conversations_list.assert_not_awaited()

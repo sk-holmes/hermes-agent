@@ -51,7 +51,10 @@ class GatewayAuthorizationMixin:
         primary_profile = getattr(self, "_primary_profile_name", None)
         if not primary_profile:
             try:
-                primary_profile = self._active_profile_name()
+                active_profile_name = getattr(self, "_active_profile_name", None)
+                primary_profile = (
+                    active_profile_name() if callable(active_profile_name) else "default"
+                )
             except Exception:
                 primary_profile = "default"
         if profile_name and profile_name != primary_profile:
