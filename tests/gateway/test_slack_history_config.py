@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gateway.config import Platform, load_gateway_config
 
 
@@ -69,3 +71,20 @@ def test_nested_slack_allowed_channels_is_profile_local(monkeypatch):
     assert config.platforms[Platform.SLACK].extra["allowed_channels"] == [
         "C_PROFILE_B"
     ]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"typo": ["C123456789"]},
+        123,
+        ["C123456789", "not-a-slack-channel"],
+    ],
+)
+def test_real_config_loader_keeps_malformed_allowed_channels_fail_closed(malformed):
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    config = _load_with_yaml_dict({"slack": {"allowed_channels": malformed}})
+    adapter = SlackAdapter(config.platforms[Platform.SLACK])
+
+    assert adapter._parse_slack_allowed_channels() == (set(), False)

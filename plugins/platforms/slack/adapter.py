@@ -76,6 +76,8 @@ _slash_user_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 # Slack member IDs are stable opaque identifiers. Reject malformed owner-list
 # values so a typo cannot grant cross-channel history to an arbitrary session.
 _SLACK_MEMBER_ID_RE = re.compile(r"^[UW][A-Z0-9]{8,}$")
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CG][A-Z0-9]{8,}$")
+_INVALID_SLACK_ALLOWED_CHANNELS = "\x00invalid_slack_allowed_channels"
 
 
 def _parse_bot_tokens(raw_token: str) -> list[str]:
@@ -1539,7 +1541,9 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id not in self._history_bot_team_ids:
             raise SlackHistoryAccessError("not_allowed_token_type")
         client = self._team_clients[team_id]
-        allowed_channels = self._slack_allowed_channels()
+        allowed_channels, allowlist_valid = self._parse_slack_allowed_channels()
+        if not allowlist_valid:
+            raise SlackHistoryAccessError("invalid_allowed_channels")
         if (
             not channel_id.startswith("D")
             and allowed_channels
@@ -1620,6 +1624,9 @@ class SlackAdapter(BasePlatformAdapter):
             or not self.allows_agent_cross_channel_history(requester_user_id)
         ):
             raise SlackHistoryAccessError("cross_channel_not_allowed")
+        allowed_channels, allowlist_valid = self._parse_slack_allowed_channels()
+        if not allowlist_valid:
+            raise SlackHistoryAccessError("invalid_allowed_channels")
 
         kwargs: Dict[str, Any] = {
             "types": "public_channel,private_channel",
@@ -1635,7 +1642,6 @@ class SlackAdapter(BasePlatformAdapter):
         if not data.get("ok", False):
             return dict(data)
 
-        allowed_channels = self._slack_allowed_channels()
         channels = []
         for raw_channel in data.get("channels", []):
             if not isinstance(raw_channel, dict):
@@ -5096,21 +5102,49 @@ class SlackAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _parse_slack_allowed_channels(self) -> tuple[set[str], bool]:
+        """Return the configured channel allowlist and whether it is valid.
+
+        Missing or explicitly empty configuration means unrestricted. Any
+        unsupported type or malformed C/G identifier is invalid so callers can
+        fail closed rather than confusing a typo with an empty allowlist.
+        """
+
+        extra = self.config.extra or {}
+        if "allowed_channels" in extra:
+            raw = extra.get("allowed_channels")
+        else:
+            raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
+
+        if raw is None:
+            return set(), True
+        if isinstance(raw, str):
+            candidates = [part.strip() for part in raw.split(",") if part.strip()]
+        elif isinstance(raw, (list, tuple, set, frozenset)):
+            candidates = [str(part).strip() for part in raw if str(part).strip()]
+        else:
+            return set(), False
+
+        if any(not _SLACK_CHANNEL_ID_RE.fullmatch(channel_id) for channel_id in candidates):
+            return set(), False
+        return set(candidates), True
+
     def _slack_allowed_channels(self) -> set:
         """Return the whitelist of channel IDs the bot will respond in.
 
         When non-empty, messages from channels NOT in this set are silently
         ignored — even if the bot is @mentioned.  DMs are never filtered.
-        Empty set means no restriction (fully backward compatible).
+        Empty set means no restriction. Malformed configuration returns a
+        deny-all sentinel so channel intake fails closed without raising from
+        the event handler.
         """
-        raw = self.config.extra.get("allowed_channels")
-        if raw is None:
-            raw = os.getenv("SLACK_ALLOWED_CHANNELS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        if isinstance(raw, str) and raw.strip():
-            return {part.strip() for part in raw.split(",") if part.strip()}
-        return set()
+        allowed_channels, valid = self._parse_slack_allowed_channels()
+        if valid:
+            return allowed_channels
+        logger.error(
+            "[Slack] Invalid allowed_channels configuration; denying channel intake"
+        )
+        return {_INVALID_SLACK_ALLOWED_CHANNELS}
 
     def _slack_mention_patterns(self) -> List["re.Pattern"]:
         """Compile optional regex wake-word patterns for channel triggers.

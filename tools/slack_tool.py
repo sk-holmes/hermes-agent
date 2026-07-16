@@ -1035,61 +1035,85 @@ def slack(
         )
 
 
-def check_slack_tool_requirements() -> bool:
-    """Profile-neutral live-service gate for registry caching.
+def _slack_tool_availability_context() -> tuple:
+    """Return selected-profile identity plus live history eligibility state."""
 
-    Do not import ``gateway.run`` here: this probe also runs in standalone CLI
-    processes, where importing the gateway would create side effects merely to
-    decide tool availability. Never read one profile's token here because the
-    result is cached process-wide. Instead, inspect only live adapter state that
-    was already authenticated by ``auth.test`` and expose the schema when at
-    least one fully history-eligible Slack adapter is present.
-    """
-
+    profile = get_session_env("HERMES_SESSION_PROFILE", "").strip()
     try:
         if importlib.util.find_spec("slack_sdk") is None:
-            return False
+            return (profile, "sdk_unavailable", False)
     except (ImportError, ValueError):
-        return False
+        return (profile, "sdk_unavailable", False)
 
     gateway_run = sys.modules.get("gateway.run")
     runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
     if not callable(runner_ref):
-        return False
+        return (profile, "runner_unavailable", False)
     try:
         runner = runner_ref()
         loop = getattr(runner, "_gateway_loop", None)
         if runner is None or loop is None or not loop.is_running():
-            return False
+            return (profile, id(runner), "loop_unavailable", False)
     except Exception:
-        return False
+        return (profile, "runner_error", False)
 
-    adapter_maps = [getattr(runner, "adapters", None) or {}]
-    profile_maps = getattr(runner, "_profile_adapters", None) or {}
-    adapter_maps.extend(
-        adapters for adapters in profile_maps.values() if isinstance(adapters, Mapping)
+    try:
+        from gateway.config import Platform
+
+        resolver = getattr(runner, "_authorization_adapter", None)
+        adapter = (
+            resolver(Platform.SLACK, profile=profile)
+            if callable(resolver)
+            else (getattr(runner, "adapters", None) or {}).get(Platform.SLACK)
+        )
+    except Exception:
+        adapter = None
+
+    team_clients = getattr(adapter, "_team_clients", None)
+    bot_team_ids = getattr(adapter, "_history_bot_team_ids", None)
+    team_ids = (
+        tuple(sorted(str(team_id) for team_id in team_clients))
+        if isinstance(team_clients, Mapping)
+        else ()
     )
-    for adapters in adapter_maps:
-        for platform, adapter in adapters.items():
-            platform_name = getattr(platform, "value", platform)
-            if str(platform_name).strip().lower() != "slack":
-                continue
-            team_clients = getattr(adapter, "_team_clients", None)
-            bot_team_ids = getattr(adapter, "_history_bot_team_ids", None)
-            if (
-                bool(getattr(adapter, "_running", False))
-                and callable(getattr(adapter, "read_history_for_agent", None))
-                and callable(
-                    getattr(adapter, "list_history_channels_for_agent", None)
-                )
-                and getattr(adapter, "_configured_workspace_count", 0) == 1
-                and isinstance(team_clients, Mapping)
-                and len(team_clients) == 1
-                and isinstance(bot_team_ids, set)
-                and next(iter(team_clients)) in bot_team_ids
-            ):
-                return True
-    return False
+    verified_bot_team_ids = (
+        tuple(sorted(str(team_id) for team_id in bot_team_ids))
+        if isinstance(bot_team_ids, set)
+        else ()
+    )
+    eligible = (
+        adapter is not None
+        and bool(getattr(adapter, "_running", False))
+        and callable(getattr(adapter, "read_history_for_agent", None))
+        and callable(getattr(adapter, "list_history_channels_for_agent", None))
+        and getattr(adapter, "_configured_workspace_count", 0) == 1
+        and len(team_ids) == 1
+        and team_ids[0] in verified_bot_team_ids
+    )
+    return (
+        profile,
+        id(runner),
+        id(adapter),
+        bool(getattr(loop, "is_running", lambda: False)()),
+        bool(getattr(adapter, "_running", False)),
+        getattr(adapter, "_configured_workspace_count", 0),
+        team_ids,
+        verified_bot_team_ids,
+        bool(eligible),
+    )
+
+
+def check_slack_tool_requirements() -> bool:
+    """Whether the selected profile has one live bot-authenticated workspace."""
+
+    return bool(_slack_tool_availability_context()[-1])
+
+
+setattr(
+    check_slack_tool_requirements,
+    "cache_context_fn",
+    _slack_tool_availability_context,
+)
 
 
 _SLACK_SCHEMA = {

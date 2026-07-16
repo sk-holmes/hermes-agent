@@ -304,7 +304,9 @@ def get_tool_definitions(
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
     # check_fn results are TTL-cached one level down, inside
-    # registry.get_definitions. The config-mtime fingerprint below captures
+    # registry.get_definitions. Dynamic service checks can contribute a
+    # profile/lifecycle context fingerprint so this outer cache cannot outlive
+    # selected-profile eligibility. The config-mtime fingerprint below captures
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
@@ -316,11 +318,20 @@ def get_tool_definitions(
             cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        availability_context_fn = getattr(
+            registry,
+            "get_check_fn_cache_context_fingerprint",
+            None,
+        )
+        availability_context = (
+            availability_context_fn() if callable(availability_context_fn) else ()
+        )
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            availability_context,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )

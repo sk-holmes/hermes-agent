@@ -180,15 +180,15 @@ class TestAgentHistoryCrossChannelAuthorization:
         adapter.config.extra.update(
             {
                 "history_cross_channel_user_ids": ["U12345678"],
-                "allowed_channels": ["C_ALLOWED"],
+                "allowed_channels": ["C123456789"],
             }
         )
 
         with pytest.raises(SlackHistoryAccessError, match="channel_not_allowed"):
             await adapter.read_history_for_agent(
-                channel_id="C_DENIED",
+                channel_id="C999999999",
                 expected_team_id="T1",
-                active_channel_id="D_ACTIVE",
+                active_channel_id="D123456789",
                 requester_user_id="U12345678",
             )
 
@@ -335,6 +335,49 @@ class TestAgentHistoryCrossChannelAuthorization:
 
         client.conversations_info.assert_not_awaited()
         client.conversations_history.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            {"typo": ["C123456789"]},
+            123,
+            ["C123456789", "not-a-slack-channel"],
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_allowed_channels_blocks_history_before_api_calls(
+        self,
+        adapter,
+        malformed,
+    ):
+        client = AsyncMock()
+        adapter._team_clients = {"T1": client}
+        adapter._configured_workspace_count = 1
+        adapter.config.extra.update(
+            {
+                "history_cross_channel_user_ids": ["U12345678"],
+                "allowed_channels": malformed,
+            }
+        )
+
+        with pytest.raises(SlackHistoryAccessError, match="invalid_allowed_channels"):
+            await adapter.read_history_for_agent(
+                channel_id="C123456789",
+                expected_team_id="T1",
+                active_channel_id="D123456789",
+                requester_user_id="U12345678",
+            )
+        with pytest.raises(SlackHistoryAccessError, match="invalid_allowed_channels"):
+            await adapter.list_history_channels_for_agent(
+                expected_team_id="T1",
+                requester_user_id="U12345678",
+                active_channel_id="D123456789",
+            )
+
+        client.conversations_info.assert_not_awaited()
+        client.conversations_history.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+        client.conversations_list.assert_not_awaited()
 
 
 def test_parse_bot_tokens_stably_deduplicates_exact_values():

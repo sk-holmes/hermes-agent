@@ -1422,7 +1422,7 @@ async def test_adapter_allowed_channel_policy_fails_before_sdk_call():
     adapter.config = PlatformConfig(
         enabled=True,
         token="xoxb-test",
-        extra={"allowed_channels": ["C_ALLOWED"]},
+        extra={"allowed_channels": [OTHER_CHANNEL_ID]},
     )
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -1465,6 +1465,78 @@ def test_check_fn_rejects_history_ineligible_adapters(monkeypatch, failure):
         adapter._team_clients = {}
 
     assert slack_tool.check_slack_tool_requirements() is False
+
+
+def test_selected_ineligible_profile_does_not_inherit_sibling_slack_schema(monkeypatch):
+    monkeypatch.setattr(slack_tool.importlib.util, "find_spec", lambda name: object())
+    runner = _install_live_gateway_runner(monkeypatch)
+    eligible = next(iter(runner.adapters.values()))
+    ineligible = SimpleNamespace(
+        _running=True,
+        read_history_for_agent=lambda **_kwargs: None,
+        list_history_channels_for_agent=lambda **_kwargs: None,
+        _configured_workspace_count=1,
+        _team_clients={"T2": object()},
+        _history_bot_team_ids=set(),
+    )
+    from gateway.config import Platform
+
+    runner._profile_adapters = {"restricted": {Platform.SLACK: ineligible}}
+    runner._authorization_adapter = lambda _platform, profile="": (
+        ineligible if profile == "restricted" else eligible
+    )
+    selected = {"profile": "restricted"}
+    monkeypatch.setattr(
+        slack_tool,
+        "get_session_env",
+        lambda name, default="": (
+            selected["profile"] if name == "HERMES_SESSION_PROFILE" else default
+        ),
+    )
+
+    import model_tools
+
+    restricted_names = {
+        tool["function"]["name"]
+        for tool in model_tools.get_tool_definitions(
+            enabled_toolsets=["slack_history"],
+            quiet_mode=True,
+        )
+    }
+    assert "slack" not in restricted_names
+
+    selected["profile"] = "default"
+    eligible_names = {
+        tool["function"]["name"]
+        for tool in model_tools.get_tool_definitions(
+            enabled_toolsets=["slack_history"],
+            quiet_mode=True,
+        )
+    }
+    assert "slack" in eligible_names
+
+
+def test_quiet_schema_tracks_slack_eligibility_without_manual_cache_clear(monkeypatch):
+    monkeypatch.setattr(slack_tool.importlib.util, "find_spec", lambda name: object())
+    runner = _install_live_gateway_runner(monkeypatch)
+    adapter = next(iter(runner.adapters.values()))
+
+    import model_tools
+
+    def schema_names():
+        return {
+            tool["function"]["name"]
+            for tool in model_tools.get_tool_definitions(
+                enabled_toolsets=["slack_history"],
+                quiet_mode=True,
+            )
+        }
+
+    assert "slack" in schema_names()
+    adapter._running = False
+    assert "slack" not in schema_names()
+    adapter._running = True
+    assert "slack" in schema_names()
 
 
 def test_check_fn_and_all_tools_schema_require_live_gateway_adapter(monkeypatch):
