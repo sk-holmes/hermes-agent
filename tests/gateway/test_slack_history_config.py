@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -88,3 +88,50 @@ def test_real_config_loader_keeps_malformed_allowed_channels_fail_closed(malform
     adapter = SlackAdapter(config.platforms[Platform.SLACK])
 
     assert adapter._parse_slack_allowed_channels() == (set(), False)
+
+
+@pytest.mark.asyncio
+async def test_mixed_malformed_history_owners_fail_closed_before_slack_calls(
+    monkeypatch,
+):
+    import plugins.platforms.slack.adapter as slack_module
+    from plugins.platforms.slack.adapter import SlackAdapter, SlackHistoryAccessError
+
+    monkeypatch.setattr(slack_module, "SLACK_AVAILABLE", True)
+    config = _load_with_yaml_dict(
+        {
+            "slack": {
+                "history_cross_channel_user_ids": [
+                    "U12345678",
+                    {"bad": "entry"},
+                ]
+            }
+        }
+    )
+    adapter = SlackAdapter(config.platforms[Platform.SLACK])
+    adapter._app = MagicMock()
+    adapter._running = True
+    adapter._configured_workspace_count = 1
+    client = AsyncMock()
+    adapter._team_clients = {"T1": client}
+    adapter._history_bot_team_ids = {"T1"}
+
+    assert adapter.allows_agent_cross_channel_history("U12345678") is False
+    with pytest.raises(SlackHistoryAccessError, match="cross_channel_not_allowed"):
+        await adapter.list_history_channels_for_agent(
+            expected_team_id="T1",
+            requester_user_id="U12345678",
+            active_channel_id="D123456789",
+        )
+    with pytest.raises(SlackHistoryAccessError, match="cross_channel_not_allowed"):
+        await adapter.read_history_for_agent(
+            channel_id="C123456789",
+            expected_team_id="T1",
+            active_channel_id="D123456789",
+            requester_user_id="U12345678",
+        )
+
+    client.conversations_list.assert_not_awaited()
+    client.conversations_info.assert_not_awaited()
+    client.conversations_history.assert_not_awaited()
+    client.conversations_replies.assert_not_awaited()

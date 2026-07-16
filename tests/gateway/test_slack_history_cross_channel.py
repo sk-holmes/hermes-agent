@@ -70,9 +70,23 @@ async def test_non_owner_cannot_discover_channels_before_slack_api_call():
     client.conversations_list.assert_not_awaited()
 
 
-def test_history_owner_config_rejects_malformed_or_environment_only_ids(monkeypatch):
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        ["not-a-member-id"],
+        ["U12345678", "not-a-member-id"],
+        ["U12345678", {"bad": "entry"}],
+        ["U12345678", ""],
+        "U12345678,not-a-member-id",
+        {"owner": "U12345678"},
+    ],
+)
+def test_history_owner_config_rejects_malformed_or_environment_only_ids(
+    monkeypatch,
+    malformed,
+):
     adapter, _ = _adapter_with_single_workspace_client()
-    adapter.config.extra["history_cross_channel_user_ids"] = ["not-a-member-id"]
+    adapter.config.extra["history_cross_channel_user_ids"] = malformed
     monkeypatch.setenv("SLACK_HISTORY_CROSS_CHANNEL_USER_IDS", "U12345678")
 
     assert adapter.allows_agent_cross_channel_history("U12345678") is False

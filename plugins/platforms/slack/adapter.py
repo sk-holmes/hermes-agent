@@ -1482,16 +1482,18 @@ class SlackAdapter(BasePlatformAdapter):
 
         raw = self.config.extra.get("history_cross_channel_user_ids", [])
         if isinstance(raw, str):
-            candidates = (part.strip() for part in raw.split(","))
+            candidates = [part.strip() for part in raw.split(",")]
         elif isinstance(raw, (list, tuple, set, frozenset)):
-            candidates = (str(part).strip() for part in raw)
+            if any(not isinstance(part, str) for part in raw):
+                return set()
+            candidates = [part.strip() for part in raw]
         else:
             return set()
-        return {
-            user_id
-            for user_id in candidates
-            if _SLACK_MEMBER_ID_RE.fullmatch(user_id)
-        }
+        if not any(candidates):
+            return set()
+        if any(not _SLACK_MEMBER_ID_RE.fullmatch(user_id) for user_id in candidates):
+            return set()
+        return set(candidates)
 
     def allows_agent_cross_channel_history(self, requester_user_id: object) -> bool:
         """Whether this profile explicitly grants the actor cross-channel reads."""
