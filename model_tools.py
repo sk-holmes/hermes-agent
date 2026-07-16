@@ -323,46 +323,60 @@ def get_tool_definitions(
             "get_check_fn_cache_context_fingerprint",
             None,
         )
-        availability_context = (
-            availability_context_fn() if callable(availability_context_fn) else ()
+        get_availability_context = (
+            availability_context_fn if callable(availability_context_fn) else lambda: ()
         )
-        cache_key = (
+        key_prefix = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            availability_context,
+        )
+        key_suffix = (
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
         )
-        cached = _tool_defs_cache.get(cache_key)
-        if cached is not None:
-            # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit.
-            global _last_resolved_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached]
-            # Return a shallow copy of the list but share the dict references —
-            # schemas are treated as read-only by all known callers.
-            return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
-        # Cache the freshly-computed list, but hand callers a shallow copy so
-        # downstream mutations (e.g. run_agent appending memory/LCM tool
-        # schemas to self.tools) don't poison the cache. Without this, a
-        # long-lived Gateway process accumulates duplicate tool names across
-        # agent inits and providers that enforce unique tool names
-        # (DeepSeek, Xiaomi MiMo, Moonshot Kimi) reject the request with
-        # HTTP 400. Mirrors the cache-hit path above. (issue #17335)
-        # Bound the cache with LRU eviction so a long-lived Gateway process
-        # doesn't accumulate entries unboundedly across the many distinct
-        # toolset/config fingerprints it sees over its lifetime (#19251).
-        if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
-            _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
-        return list(result)
-    return result
+        for attempt in range(2):
+            availability_before = get_availability_context()
+            cache_key = key_prefix + (availability_before,) + key_suffix
+            cached = _tool_defs_cache.get(cache_key)
+            if cached is not None:
+                availability_after = get_availability_context()
+                if availability_before == availability_after:
+                    # Update _last_resolved_tool_names so downstream callers see
+                    # consistent state even on a cache hit.
+                    global _last_resolved_tool_names
+                    _last_resolved_tool_names = [
+                        tool["function"]["name"] for tool in cached
+                    ]
+                    return list(cached)
+                if attempt == 0:
+                    continue
+
+            result = _compute_tool_definitions(
+                enabled_toolsets,
+                disabled_toolsets,
+                quiet_mode,
+                skip_tool_search_assembly=skip_tool_search_assembly,
+            )
+            availability_after = get_availability_context()
+            if availability_before == availability_after:
+                # Cache only a stable lifecycle snapshot. A transition during
+                # computation retries once; a second race returns uncached.
+                if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
+                    _tool_defs_cache.pop(next(iter(_tool_defs_cache)))
+                _tool_defs_cache[cache_key] = result
+                return list(result)
+            if attempt == 1:
+                return list(result)
+
+    return _compute_tool_definitions(
+        enabled_toolsets,
+        disabled_toolsets,
+        quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
 
 
 def _compute_tool_definitions(

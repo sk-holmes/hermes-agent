@@ -145,6 +145,7 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
+_CHECK_FN_CACHE_MAX_ENTRIES = 256
 _check_fn_cache: Dict[tuple[Callable, object], tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
 _check_fn_last_good: Dict[tuple[Callable, object], float] = {}
@@ -174,18 +175,51 @@ def _check_fn_context(fn: Callable) -> object:
     return context
 
 
+def _prune_check_fn_caches(now: float) -> None:
+    """Expire old contextual entries and bound both check caches."""
+
+    retention = max(_CHECK_FN_TTL_SECONDS, _CHECK_FN_FAILURE_GRACE_SECONDS)
+    for key, (timestamp, _) in list(_check_fn_cache.items()):
+        if now - timestamp >= retention:
+            _check_fn_cache.pop(key, None)
+            _check_fn_last_good.pop(key, None)
+    for key, timestamp in list(_check_fn_last_good.items()):
+        if now - timestamp >= retention:
+            _check_fn_last_good.pop(key, None)
+
+    if len(_check_fn_cache) > _CHECK_FN_CACHE_MAX_ENTRIES:
+        overflow = len(_check_fn_cache) - _CHECK_FN_CACHE_MAX_ENTRIES
+        oldest = sorted(_check_fn_cache, key=lambda key: _check_fn_cache[key][0])
+        for key in oldest[:overflow]:
+            _check_fn_cache.pop(key, None)
+            _check_fn_last_good.pop(key, None)
+    if len(_check_fn_last_good) > _CHECK_FN_CACHE_MAX_ENTRIES:
+        overflow = len(_check_fn_last_good) - _CHECK_FN_CACHE_MAX_ENTRIES
+        oldest = sorted(
+            _check_fn_last_good,
+            key=lambda key: _check_fn_last_good[key],
+        )
+        for key in oldest[:overflow]:
+            _check_fn_last_good.pop(key, None)
+            _check_fn_cache.pop(key, None)
+
+
 def _check_fn_cached(fn: Callable) -> bool:
-    """Return bool(fn()), TTL-cached across calls.
+    """Return a requirement verdict, TTL-cached across calls.
 
     Exceptions are swallowed as False. A transient False/exception within
     ``_CHECK_FN_FAILURE_GRACE_SECONDS`` of the last True is suppressed (the
     last-good True is returned and the failure is NOT cached, so the next call
     re-probes) to keep flaky external checks (Docker daemon busy, socket
-    contention, probe timeout) from silently stripping tools mid-session.
+    contention, probe timeout) from silently stripping tools mid-session. A
+    contextual check may derive its verdict from the exact sampled context via
+    ``check_value_from_context_fn`` so cache identity and value cannot diverge.
     """
     now = time.monotonic()
-    cache_key = (fn, _check_fn_context(fn))
+    context = _check_fn_context(fn)
+    cache_key = (fn, context)
     with _check_fn_cache_lock:
+        _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
@@ -194,7 +228,12 @@ def _check_fn_cached(fn: Callable) -> bool:
 
     raised = False
     try:
-        value = bool(fn())
+        value_from_context = getattr(fn, "check_value_from_context_fn", None)
+        value = bool(
+            value_from_context(context)
+            if callable(value_from_context)
+            else fn()
+        )
     except Exception:
         value = False
         raised = True
@@ -203,6 +242,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         if value:
             _check_fn_last_good[cache_key] = now
             _check_fn_cache[cache_key] = (now, True)
+            _prune_check_fn_caches(now)
             return True
 
         last_good = _check_fn_last_good.get(cache_key)
@@ -227,6 +267,7 @@ def _check_fn_cached(fn: Callable) -> bool:
             "raised" if raised else "returned False",
         )
         _check_fn_cache[cache_key] = (now, False)
+        _prune_check_fn_caches(now)
         return False
 
 

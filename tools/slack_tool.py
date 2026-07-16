@@ -1052,8 +1052,9 @@ def _slack_tool_availability_context() -> tuple:
     try:
         runner = runner_ref()
         loop = getattr(runner, "_gateway_loop", None)
-        if runner is None or loop is None or not loop.is_running():
-            return (profile, id(runner), "loop_unavailable", False)
+        loop_running = bool(loop is not None and loop.is_running())
+        if runner is None or not loop_running:
+            return (profile, "loop_unavailable", False)
     except Exception:
         return (profile, "runner_error", False)
 
@@ -1069,36 +1070,46 @@ def _slack_tool_availability_context() -> tuple:
     except Exception:
         adapter = None
 
-    team_clients = getattr(adapter, "_team_clients", None)
-    bot_team_ids = getattr(adapter, "_history_bot_team_ids", None)
-    team_ids = (
-        tuple(sorted(str(team_id) for team_id in team_clients))
-        if isinstance(team_clients, Mapping)
-        else ()
+    adapter_running = bool(getattr(adapter, "_running", False))
+    configured_workspace_count = getattr(adapter, "_configured_workspace_count", 0)
+    read_available = callable(getattr(adapter, "read_history_for_agent", None))
+    list_available = callable(
+        getattr(adapter, "list_history_channels_for_agent", None)
     )
-    verified_bot_team_ids = (
-        tuple(sorted(str(team_id) for team_id in bot_team_ids))
-        if isinstance(bot_team_ids, set)
-        else ()
-    )
+    try:
+        team_clients = getattr(adapter, "_team_clients", None)
+        team_ids = (
+            tuple(sorted(str(team_id) for team_id in team_clients))
+            if isinstance(team_clients, Mapping)
+            else ()
+        )
+        bot_team_ids = getattr(adapter, "_history_bot_team_ids", None)
+        verified_bot_team_ids = (
+            tuple(sorted(str(team_id) for team_id in bot_team_ids))
+            if isinstance(bot_team_ids, set)
+            else ()
+        )
+    except RuntimeError:
+        team_ids = ()
+        verified_bot_team_ids = ()
     eligible = (
         adapter is not None
-        and bool(getattr(adapter, "_running", False))
-        and callable(getattr(adapter, "read_history_for_agent", None))
-        and callable(getattr(adapter, "list_history_channels_for_agent", None))
-        and getattr(adapter, "_configured_workspace_count", 0) == 1
+        and adapter_running
+        and read_available
+        and list_available
+        and configured_workspace_count == 1
         and len(team_ids) == 1
         and team_ids[0] in verified_bot_team_ids
     )
     return (
         profile,
-        id(runner),
-        id(adapter),
-        bool(getattr(loop, "is_running", lambda: False)()),
-        bool(getattr(adapter, "_running", False)),
-        getattr(adapter, "_configured_workspace_count", 0),
+        loop_running,
+        adapter_running,
+        configured_workspace_count,
         team_ids,
         verified_bot_team_ids,
+        read_available,
+        list_available,
         bool(eligible),
     )
 
@@ -1109,10 +1120,21 @@ def check_slack_tool_requirements() -> bool:
     return bool(_slack_tool_availability_context()[-1])
 
 
+def _slack_tool_requirement_from_context(context: object) -> bool:
+    """Derive a check verdict from the exact context used as its cache key."""
+
+    return isinstance(context, tuple) and bool(context) and context[-1] is True
+
+
 setattr(
     check_slack_tool_requirements,
     "cache_context_fn",
     _slack_tool_availability_context,
+)
+setattr(
+    check_slack_tool_requirements,
+    "check_value_from_context_fn",
+    _slack_tool_requirement_from_context,
 )
 
 

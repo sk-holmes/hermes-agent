@@ -108,6 +108,48 @@ class TestQuietModeCacheIsolation:
             "Eviction should keep the cache at the cap, not clear it or grow"
         )
 
+    @pytest.mark.parametrize(
+        ("before", "during"),
+        [("eligible", "ineligible"), ("ineligible", "eligible")],
+    )
+    def test_transition_during_computation_is_not_cached_under_stale_context(
+        self,
+        monkeypatch,
+        before,
+        during,
+    ):
+        state = {"context": before, "transition": True}
+        monkeypatch.setattr(
+            model_tools.registry,
+            "get_check_fn_cache_context_fingerprint",
+            lambda: (state["context"],),
+        )
+
+        def fake_compute(*_args, **_kwargs):
+            if state["transition"]:
+                state["context"] = during
+                state["transition"] = False
+            name = f"tool_{state['context']}"
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", fake_compute)
+
+        first = model_tools.get_tool_definitions(quiet_mode=True)
+        assert first[0]["function"]["name"] == f"tool_{during}"
+
+        state["context"] = before
+        second = model_tools.get_tool_definitions(quiet_mode=True)
+        assert second[0]["function"]["name"] == f"tool_{before}"
+
     def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014
         explains why the bug only hit Gateway."""
