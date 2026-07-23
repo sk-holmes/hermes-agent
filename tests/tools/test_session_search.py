@@ -786,6 +786,29 @@ class TestRecallPayloadSafety:
             for message in result["messages"]
         )
 
+    def test_read_aggregate_budget_preserves_original_length_across_both_layers(self, db):
+        db.create_session("s_layered_response_metadata", source="cli")
+        content = "x" * (_MESSAGE_CONTENT_MAX_CHARS + 2000)
+        for index in range(30):
+            db.append_message(
+                "s_layered_response_metadata",
+                role="user" if index % 2 == 0 else "assistant",
+                content=content,
+            )
+        db._conn.commit()
+
+        raw = session_search(session_id="s_layered_response_metadata", db=db)
+        result = json.loads(raw)
+
+        assert len(raw) <= _RESPONSE_MAX_CHARS
+        assert result["response_truncated"] is True
+        assert result["response_fields_truncated"] is True
+        assert all(message["content_truncated"] is True for message in result["messages"])
+        assert all(
+            message["original_content_chars"] == len(content)
+            for message in result["messages"]
+        )
+
     def test_read_structural_overflow_fails_closed(self, db):
         db.create_session("s_structural_overflow", source="cli")
         for _ in range(30):
@@ -1673,6 +1696,55 @@ class TestLegacyRotationDiscovery:
         sids = [r["session_id"] for r in result["results"]]
         assert "s_parent" in sids
 
+    def test_compression_parent_discovery_anchor_can_be_scrolled_from_child(self, db):
+        db.create_session("s_scroll_parent", source="cli")
+        db.append_message(
+            "s_scroll_parent",
+            role="user",
+            content="legacy rotation archived anchor",
+        )
+        db.append_message(
+            "s_scroll_parent",
+            role="assistant",
+            content="legacy rotation answer",
+        )
+        db.end_session("s_scroll_parent", "compression")
+        db.create_session(
+            "s_scroll_child",
+            source="cli",
+            parent_session_id="s_scroll_parent",
+        )
+        db.append_message(
+            "s_scroll_child",
+            role="user",
+            content="active continuation",
+        )
+
+        discovery = json.loads(
+            session_search(
+                query="legacy rotation archived anchor",
+                db=db,
+                current_session_id="s_scroll_child",
+            )
+        )
+        hit = discovery["results"][0]
+
+        scrolled = json.loads(
+            session_search(
+                session_id=hit["session_id"],
+                around_message_id=hit["match_message_id"],
+                db=db,
+                current_session_id="s_scroll_child",
+            )
+        )
+
+        assert scrolled["success"] is True
+        assert any(
+            message.get("anchor")
+            and "legacy rotation archived anchor" in message["content"]
+            for message in scrolled["messages"]
+        )
+
     def test_multi_level_compression_chain_discoverable(self, db):
         """Grandparent → parent → child, each compression-rotated. Content from
         ancestors must be discoverable."""
@@ -1904,6 +1976,78 @@ class TestRewindExclusion:
         )
 
         entry = result["results"][0]
+        visible = entry["bookend_start"] + entry["messages"] + entry["bookend_end"]
+        assert all("abandoned" not in message["content"] for message in visible)
+
+    def test_rewind_visibility_guards_cover_anchor_after_and_distant_bookends(self, db):
+        db.create_session("s_rewind_guards", source="cli")
+        opening_id = db.append_message(
+            "s_rewind_guards",
+            role="user",
+            content="active opening anchor",
+        )
+        abandoned_id = db.append_message(
+            "s_rewind_guards",
+            role="user",
+            content="abandoned branch instruction",
+        )
+        db.append_message(
+            "s_rewind_guards",
+            role="assistant",
+            content="abandoned branch answer",
+        )
+        db.rewind_to_message("s_rewind_guards", abandoned_id)
+        db.append_message(
+            "s_rewind_guards",
+            role="user",
+            content="replacement branch instruction",
+        )
+        db.append_message(
+            "s_rewind_guards",
+            role="assistant",
+            content="replacement branch answer",
+        )
+
+        rewound_anchor = json.loads(
+            session_search(
+                session_id="s_rewind_guards",
+                around_message_id=abandoned_id,
+                db=db,
+            )
+        )
+        assert rewound_anchor["success"] is False
+
+        active_window = json.loads(
+            session_search(
+                session_id="s_rewind_guards",
+                around_message_id=opening_id,
+                window=5,
+                db=db,
+            )
+        )
+        assert active_window["success"] is True
+        assert all(
+            "abandoned" not in message["content"]
+            for message in active_window["messages"]
+        )
+
+        for index in range(12):
+            db.append_message(
+                "s_rewind_guards",
+                role="assistant",
+                content=f"active filler {index}",
+            )
+        db.append_message(
+            "s_rewind_guards",
+            role="user",
+            content="distant replacement needle",
+        )
+        db._conn.commit()
+
+        discovery = json.loads(
+            session_search(query="distant replacement needle", limit=1, db=db)
+        )
+        entry = discovery["results"][0]
         visible = entry["bookend_start"] + entry["messages"] + entry["bookend_end"]
         assert all("abandoned" not in message["content"] for message in visible)
 

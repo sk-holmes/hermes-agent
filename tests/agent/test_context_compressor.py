@@ -2539,6 +2539,42 @@ class TestCompressWithClient:
             {"role": "assistant", "content": structured}
         ) is None
 
+    def test_structured_merged_summary_uses_canonical_boundary_after_quoted_delimiter(self):
+        from agent.context_compressor import (
+            SUMMARY_PREFIX,
+            _MERGED_PRIOR_CONTEXT_HEADER,
+            _MERGED_SUMMARY_DELIMITER,
+        )
+
+        structured = [
+            {
+                "type": "text",
+                "text": (
+                    f"{_MERGED_PRIOR_CONTEXT_HEADER}\nREAL PRIOR START\n"
+                    f"quoted marker: {_MERGED_SUMMARY_DELIMITER}\n"
+                    "not a summary prefix\nREAL PRIOR END"
+                ),
+            },
+            {
+                "type": "text",
+                "text": (
+                    f"{_MERGED_SUMMARY_DELIMITER}\n{SUMMARY_PREFIX}\n"
+                    "REAL SUMMARY BODY"
+                ),
+            },
+        ]
+
+        unwrapped = ContextCompressor._strip_context_summary_handoff_message(
+            {"role": "assistant", "content": structured}
+        )
+
+        assert unwrapped is not None
+        text = str(unwrapped["content"])
+        assert "REAL PRIOR START" in text
+        assert "not a summary prefix" in text
+        assert "REAL PRIOR END" in text
+        assert "REAL SUMMARY BODY" not in text
+
     def test_recompaction_does_not_reinject_ambiguous_legacy_summary_as_real_turn(self):
         from agent.context_compressor import (
             SUMMARY_PREFIX,
